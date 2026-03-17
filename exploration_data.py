@@ -18,7 +18,9 @@ archivos = sorted(list(carpeta_excels.glob('*.xlsx')) + list(carpeta_excels.glob
 def fusionar_headers_multilinea(archivo_path, hoja, fila_inicio, num_filas=2):
     """Fusiona headers que están en múltiples filas (merged cells)"""
     try:
-        df_raw = pd.read_excel(archivo_path, sheet_name=hoja, header=None)
+        # Seleccionar engine según extensión
+        engine = 'xlrd' if str(archivo_path).endswith('.xls') else 'openpyxl'
+        df_raw = pd.read_excel(archivo_path, sheet_name=hoja, header=None, engine=engine)
         
         if fila_inicio + num_filas > len(df_raw):
             return None
@@ -41,8 +43,12 @@ def fusionar_headers_multilinea(archivo_path, hoja, fila_inicio, num_filas=2):
                 headers_fusionados.append(f'Unnamed_{col_idx}')
         
         return headers_fusionados
-    except:
+    except Exception as e:
         return None
+
+def obtener_engine(archivo_path):
+    """Retorna el engine correcto según la extensión del archivo"""
+    return 'xlrd' if str(archivo_path).endswith('.xls') else 'openpyxl'
 
 def es_grupo_valido(columnas):
     """Descarta grupos con demasiados Unnamed"""
@@ -182,48 +188,53 @@ def obtener_columnas_nucleo(columnas_semanticas):
     return presentes, tiene_grupos_edad
 
 # ============================================================================
-# CLASIFICACIÓN POR TIPO DE REPORTE
+# CLASIFICACIÓN POR TIPO DE REPORTE - UNIFICADA
 # ============================================================================
 
+# Esquema base unificado para CAUSAS
+# Campos obligatorios: diagnostico, total
+# Campos opcionales: codigo_diagnostico, porcentaje, zona_*, sexo_*, subregion, municipio, codigo_municipio
+
+ESQUEMA_CAUSAS = {
+    'obligatorios': {'diagnostico', 'total'},
+    'opcionales': {
+        'codigo_diagnostico', 'porcentaje', 
+        'zona_urbana', 'zona_rural',
+        'sexo_masculino', 'sexo_femenino', 'sexo_no_definido',
+        'subregion', 'municipio', 'codigo_municipio'
+    }
+}
+
 def clasificar_tipo_reporte(nombre_archivo, columnas_nucleo, tiene_grupos_edad):
-    """Clasifica el archivo en un tipo de reporte basado en columnas + nombre"""
+    """Clasifica el archivo en un tipo de reporte simplificado"""
     nombre = nombre_archivo.lower()
     
-    # Tipo AGRUPACION22 - tiene grupos de edad numéricos
+    # TIPO 1: AGRUPACION22 - tiene grupos de edad numéricos (0-21)
     if tiene_grupos_edad:
-        if 'municipio' in columnas_nucleo or 'mpio' in nombre or 'region' in nombre:
-            return 'AGRUPACION22_MUNICIPIO'
-        return 'AGRUPACION22_DEPTO'
+        return 'AGRUPACION22'
     
-    # Detectar por nivel geográfico
+    # TIPO 2: CAUSAS - tiene diagnostico y/o total (con variantes de ubicación)
+    tiene_diagnostico = 'diagnostico' in columnas_nucleo
+    tiene_total = 'total' in columnas_nucleo
+    tiene_codigo_dx = 'codigo_diagnostico' in columnas_nucleo
+    
+    if tiene_diagnostico or tiene_codigo_dx or tiene_total:
+        return 'CAUSAS'
+    
+    # TIPO 3: OTRO - no encaja en ninguna categoría
+    return 'OTRO'
+
+def obtener_nivel_geografico(columnas_nucleo):
+    """Determina el nivel geográfico de los datos"""
     tiene_municipio = 'municipio' in columnas_nucleo or 'codigo_municipio' in columnas_nucleo
     tiene_subregion = 'subregion' in columnas_nucleo
     
-    # Detectar por nombre de archivo
-    es_top10 = any(x in nombre for x in ['diezprimeras', 'diez_primeras', 'top10', '10_primeras'])
-    es_por_mpio = any(x in nombre for x in ['mpio', 'municipio', 'por_mpio'])
-    es_por_subregion = any(x in nombre for x in ['subregion', 'subregión', 'por_subregion'])
-    es_departamento = 'departamento' in nombre or 'total_departamento' in nombre
-    es_morbilidad = 'morbilidad' in nombre and 'formato' in nombre
-    
-    # Clasificar
-    if es_morbilidad:
-        return 'MORBILIDAD_FORMATO'
-    
-    if tiene_municipio or es_por_mpio:
-        return 'CAUSAS_MUNICIPIO'
-    
-    if tiene_subregion or es_por_subregion:
-        return 'CAUSAS_SUBREGION'
-    
-    if es_departamento:
-        return 'CAUSAS_DEPARTAMENTO'
-    
-    # Por defecto, es TOP10 simple
-    if 'codigo_diagnostico' in columnas_nucleo:
-        return 'CAUSAS_CODIGO'
-    
-    return 'CAUSAS_SIMPLE'
+    if tiene_municipio:
+        return 'MUNICIPIO'
+    elif tiene_subregion:
+        return 'SUBREGION'
+    else:
+        return 'DEPARTAMENTO'
 
 def calcular_score_variante(resultado):
     """Calcula un score para elegir la mejor variante de un archivo"""
@@ -251,7 +262,10 @@ for archivo_path in archivos:
     archivo = archivo_path.name
     
     try:
-        xl_file = pd.ExcelFile(archivo_path)
+        # Seleccionar engine según extensión
+        engine = obtener_engine(archivo_path)
+        
+        xl_file = pd.ExcelFile(archivo_path, engine=engine)
         hoja = xl_file.sheet_names[0]
         for h in xl_file.sheet_names:
             if 'datos' in h.lower():
@@ -261,13 +275,14 @@ for archivo_path in archivos:
         # Probar las primeras 10 filas como headers (simple)
         for fila_header in range(10):
             try:
-                df = pd.read_excel(archivo_path, sheet_name=hoja, header=fila_header, nrows=5)
+                df = pd.read_excel(archivo_path, sheet_name=hoja, header=fila_header, nrows=5, engine=engine)
                 columnas = [str(col).strip() for col in df.columns]
                 columnas_semanticas = [normalizar_semantico(c) for c in columnas]
                 
                 if es_grupo_valido(columnas):
                     columnas_nucleo, tiene_grupos_edad = obtener_columnas_nucleo(columnas_semanticas)
                     tipo_reporte = clasificar_tipo_reporte(archivo, columnas_nucleo, tiene_grupos_edad)
+                    nivel_geo = obtener_nivel_geografico(columnas_nucleo)
                     
                     resultados_exploracion.append({
                         'archivo': archivo,
@@ -277,10 +292,11 @@ for archivo_path in archivos:
                         'columnas_nucleo': columnas_nucleo,
                         'tiene_grupos_edad': tiene_grupos_edad,
                         'tipo_reporte': tipo_reporte,
+                        'nivel_geografico': nivel_geo,
                         'num_columnas': len(columnas),
                         'tipo': 'simple'
                     })
-            except:
+            except Exception as e:
                 pass
         
         # Probar headers multilineales
@@ -290,6 +306,7 @@ for archivo_path in archivos:
                 columnas_semanticas = [normalizar_semantico(c) for c in headers_fusionados]
                 columnas_nucleo, tiene_grupos_edad = obtener_columnas_nucleo(columnas_semanticas)
                 tipo_reporte = clasificar_tipo_reporte(archivo, columnas_nucleo, tiene_grupos_edad)
+                nivel_geo = obtener_nivel_geografico(columnas_nucleo)
                 
                 resultados_exploracion.append({
                     'archivo': archivo,
@@ -299,11 +316,12 @@ for archivo_path in archivos:
                     'columnas_nucleo': columnas_nucleo,
                     'tiene_grupos_edad': tiene_grupos_edad,
                     'tipo_reporte': tipo_reporte,
+                    'nivel_geografico': nivel_geo,
                     'num_columnas': len(headers_fusionados),
                     'tipo': 'multilinea'
                 })
-    except:
-        pass
+    except Exception as e:
+        print(f"  ⚠️ Error procesando {archivo}: {type(e).__name__}")
 
 # ============================================================================
 # SELECCIONAR MEJOR VARIANTE POR ARCHIVO
@@ -335,7 +353,7 @@ print(f"Variantes descartadas: {len(resultados_exploracion) - len(mejores_varian
 # ============================================================================
 
 print(f"\n{'='*80}")
-print("AGRUPACIÓN POR TIPO DE REPORTE")
+print("AGRUPACIÓN POR TIPO DE REPORTE (UNIFICADO)")
 print(f"{'='*80}\n")
 
 # Agrupar por tipo
@@ -349,28 +367,45 @@ grupos_ordenados = sorted(grupos_por_tipo.items(), key=lambda x: len(x[1]), reve
 print(f"TIPOS DE REPORTE DETECTADOS: {len(grupos_por_tipo)}\n")
 
 for idx, (tipo, archivos_grupo) in enumerate(grupos_ordenados, 1):
-    print(f"\n{'─'*80}")
+    print(f"\n{'='*80}")
     print(f"TIPO {idx}: {tipo} ({len(archivos_grupo)} archivos)")
-    print(f"{'─'*80}")
+    print(f"{'='*80}")
     
-    # Mostrar columnas núcleo comunes
+    # Mostrar columnas núcleo comunes (unión de todas)
     todas_columnas = set()
     for v in archivos_grupo:
         todas_columnas.update(v['columnas_nucleo'])
-    print(f"Columnas núcleo: {sorted(todas_columnas)}")
+    print(f"\nColumnas núcleo (todas las variantes): {sorted(todas_columnas)}")
     
-    # Mostrar ejemplo de columnas originales
-    ejemplo = archivos_grupo[0]
-    print(f"Ejemplo ({ejemplo['archivo']}, fila {ejemplo['fila_header']}):")
-    print(f"  Original: {ejemplo['columnas'][:8]}{'...' if len(ejemplo['columnas']) > 8 else ''}")
-    print(f"  Semántico: {ejemplo['columnas_semanticas'][:8]}{'...' if len(ejemplo['columnas_semanticas']) > 8 else ''}")
+    # Agrupar por nivel geográfico dentro del tipo
+    por_nivel_geo = defaultdict(list)
+    for v in archivos_grupo:
+        por_nivel_geo[v['nivel_geografico']].append(v)
     
-    print(f"\nArchivos:")
-    for v in archivos_grupo[:15]:  # Limitar a 15 para no saturar
-        tipo_marca = '[M]' if v['tipo'] == 'multilinea' else '[S]'
-        print(f"  • {tipo_marca} {v['archivo']} (fila {v['fila_header']})")
-    if len(archivos_grupo) > 15:
-        print(f"  ... y {len(archivos_grupo) - 15} más")
+    for nivel_geo, archivos_nivel in sorted(por_nivel_geo.items(), key=lambda x: len(x[1]), reverse=True):
+        print(f"\n  {'─'*70}")
+        print(f"  Nivel: {nivel_geo} ({len(archivos_nivel)} archivos)")
+        print(f"  {'─'*70}")
+        
+        # Mostrar columnas específicas de este nivel
+        cols_nivel = set()
+        for v in archivos_nivel:
+            cols_nivel.update(v['columnas_nucleo'])
+        print(f"  Columnas: {sorted(cols_nivel)}")
+        
+        # Mostrar ejemplo
+        ejemplo = archivos_nivel[0]
+        print(f"  Ejemplo ({ejemplo['archivo']}):")
+        print(f"    Fila header: {ejemplo['fila_header']}")
+        print(f"    Original: {ejemplo['columnas'][:8]}{'...' if len(ejemplo['columnas']) > 8 else ''}")
+        
+        # Listar archivos
+        print(f"  Archivos:")
+        for v in archivos_nivel[:10]:
+            tipo_marca = '[M]' if v['tipo'] == 'multilinea' else '[S]'
+            print(f"    • {tipo_marca} {v['archivo']} (fila {v['fila_header']})")
+        if len(archivos_nivel) > 10:
+            print(f"    ... y {len(archivos_nivel) - 10} más")
 
 # ============================================================================
 # RESUMEN FINAL
@@ -381,30 +416,51 @@ print("RESUMEN FINAL")
 print(f"{'='*80}")
 print(f"Total de archivos analizados: {len(archivos)}")
 print(f"Archivos con variante seleccionada: {len(mejores_variantes)}")
-print(f"TIPOS DE REPORTE: {len(grupos_por_tipo)}")
+print(f"TIPOS DE REPORTE PRINCIPALES: {len(grupos_por_tipo)}")
 
-print(f"\nDistribución por tipo:")
+print("\nDistribución por tipo:")
 for tipo, archivos_grupo in grupos_ordenados:
     pct = len(archivos_grupo) / len(mejores_variantes) * 100
-    print(f"  • {tipo}: {len(archivos_grupo)} archivos ({pct:.1f}%)")
+    
+    # Contar por nivel geográfico
+    por_nivel = defaultdict(int)
+    for v in archivos_grupo:
+        por_nivel[v['nivel_geografico']] += 1
+    
+    niveles_str = ', '.join(f"{k}:{v}" for k, v in sorted(por_nivel.items()))
+    print(f"  • {tipo}: {len(archivos_grupo)} archivos ({pct:.1f}%) - [{niveles_str}]")
 
 # Archivos no clasificados o problemáticos
-archivos_analizados = set(v['archivo'] for v in mejores_variantes)
-archivos_faltantes = set(a.name for a in archivos) - archivos_analizados
+archivos_analizados = {v['archivo'] for v in mejores_variantes}
+archivos_faltantes = {a.name for a in archivos} - archivos_analizados
 if archivos_faltantes:
     print(f"\n⚠️  Archivos sin clasificar ({len(archivos_faltantes)}):")
     for a in sorted(archivos_faltantes)[:10]:
         print(f"  • {a}")
+    if len(archivos_faltantes) > 10:
+        print(f"  ... y {len(archivos_faltantes) - 10} más")
 
 print(f"\n{'='*80}")
-print("TIPOS DE REPORTE DISPONIBLES:")
+print("ESQUEMA UNIFICADO DE COLUMNAS:")
 print("─"*40)
-print("• CAUSAS_SIMPLE      - Top 10 causas básico")
-print("• CAUSAS_CODIGO      - Top 10 con código diagnóstico")
-print("• CAUSAS_SUBREGION   - Causas por subregión")
-print("• CAUSAS_MUNICIPIO   - Causas por municipio")
-print("• CAUSAS_DEPARTAMENTO- Total departamento")
-print("• AGRUPACION22_DEPTO - 22 grupos por edad (depto)")
-print("• AGRUPACION22_MUNICIPIO - 22 grupos por municipio")
-print("• MORBILIDAD_FORMATO - Formato especial morbilidad")
+print("OBLIGATORIAS:")
+print("  • diagnostico    - Nombre/descripción de la causa")
+print("  • total          - Total de casos")
+print("\nOPCIONALES:")
+print("  • codigo_diagnostico - Código de la causa (ej: CIE-10)")
+print("  • porcentaje     - Porcentaje del total")
+print("  • zona_urbana    - Casos en zona urbana/cabecera")
+print("  • zona_rural     - Casos en zona rural/resto")
+print("  • sexo_masculino - Casos hombres")
+print("  • sexo_femenino  - Casos mujeres")
+print("  • sexo_no_definido - Casos sin sexo definido")
+print("  • subregion      - Nombre de la subregión")
+print("  • municipio      - Nombre del municipio")
+print("  • codigo_municipio - Código DANE del municipio")
+print(f"\n{'='*80}")
+print("TIPOS DE REPORTE:")
+print("─"*40)
+print("• CAUSAS       - Top causas de morbilidad (consulta/urgencias/hospitalización)")
+print("• AGRUPACION22 - Agrupación por 22 grupos de edad (0-21)")
+print("• OTRO         - Formatos no clasificados")
 print(f"{'='*80}")
